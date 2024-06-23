@@ -1,0 +1,634 @@
+clc
+close all
+
+% Start a timer
+tic
+
+% % % % % % % % % % % % % % % % % % % % % % % % % % % % % % % % % % % % % 
+% % % % % % % % % % % % % % % % % % % % % % % % % % % % % % % % % % % % %
+
+% Overview:
+% Simulates Needle Valve by modeling isentropic flow through a variable CV to
+% displace the water on the Waflo Stand. The control logic is based off of a PID Control
+% loop with valve timings from testing
+
+% % % % % % % % % % % % % % % % % % % % % % % % % % % % % % % % % % % % %
+%% Config
+
+% Unit Conversions
+psiToPa = 6894.76; % Pa/psi
+litersToCubicMeters = 0.001; % m^3/L
+inToMeters = 0.0254; % m/in
+kelvinToRankine = 1.8; % R/K
+cubicFtToCubicMeters = 0.02832; %m^3/ft^3
+
+% General Parameters
+updateTime = 0.001; % s, MCFS refresh rate
+press = 'GN2';
+chamberPressure = 300 * psiToPa; % Pa, set to ambient for waflo simulation
+dt = 1e-4; % s, physics calculation timestep length
+logInterval = 1e-2; % s, interval at which data is saved
+maxTime = 100; % s
+enableReg = false;
+step_size = 1; %needle valve has 200 steps for 1 full rotation with step sizes
+               %of 1, 0.5, 0.25, 0.125, and .125/2 possible
+actuation_time = 0.01; %(s) actuation time for one step command
+steps_per_turn = 200;
+Cv_per_turn = 0.85;
+chamber_pressure = 0 * psiToPa; % Psi -> Pa
+
+orf_Area = 1.22e-4 % m^2
+
+lox_mdot = 7 % kg/s
+fuel_mdot = 3.5 % kg/s
+
+%Added variables for convinience
+regged_p = 2500; %psi
+fuel_tank_target_p = 350; %psi
+fuel_ullage = 0.05; %percent
+fuel_tank_volume = 40; %L
+fuel_volume = (1-fuel_ullage)*fuel_tank_volume %L
+
+lox_tank_target_p = 350; %psi
+lox_ullage = 0.05 %percent
+lox_tank_volume = 40; %L
+lox_volume = (1-lox_ullage)*lox_tank_volume %L
+
+% Tanks
+%Storage Lists (Each tank)
+fuel = struct;
+lox = struct;
+pressurant = struct;
+
+%Pressurant Constants
+switch upper(press)
+    case 'GN2'
+        pressurant.y = 7/5;
+        pressurant.mol_mass = 28; % g/mol
+        pressurant.a = 0.137; % m^6 * Pa/mol^2, Van der Waal coeffs
+        pressurant.b = 3.87*10^(-5); % m^3/mol
+        pressurant.sg = 0.9669; %Specific Gravity
+   
+    case 'HE'
+        pressurant.y = 5/3;
+        pressurant.mol_mass = 4; % g/mol
+        pressurant.a = 0.00346; % m^6 Pa/mol^2, Van der Waal coeffs
+        pressurant.b = 2.38*10^(-5); % m^3/mol
+        pressurant.sg = 0.138; %Specific Gravity
+    otherwise
+        warning('Choose Pressurant')
+end
+
+fuel.p_coeff = 0.6*(1.3);
+fuel.i_coeff = 1.2*(1.3/0.8);
+fuel.d_coeff = 0.075*(1.3*0.8);
+fuel_i_growth_rate = 0;
+fuel.set_point = 0;
+
+lox.p_coeff = 0.6*1.7;
+lox.i_coeff = 1.2*(1.7/2.5);
+lox.d_coeff = 0.075*(1.7/2.5);
+lox_i_growth_rate = 0;
+lox.set_point = 0;
+
+
+
+R = 8314.46261815324; % J/kmol*K
+
+pressurant.Rspec = R / pressurant.mol_mass; % J/kgK
+pressurant.P = regged_p * psiToPa; % Psi
+pressurant.T = 300; %K, temp of ambient
+regEffectiveV = vanDerWaalSpecMolVol(800 * psiToPa, pressurant.T, pressurant.a, pressurant.b); % m3/mol, should change to consider droop in the future
+
+%water
+
+fuel.tankVol = fuel_tank_volume * litersToCubicMeters; % m^3
+fuel.propVol = fuel_volume*litersToCubicMeters; %m^3
+fuel.ullage = 1 - (fuel.propVol/fuel.tankVol); % Ullage proporion of water tank
+fuel.ullageVol = fuel.tankVol * fuel.ullage;
+fuel.rho = 804 % kg/m^3
+fuel.T = 300; %K 
+fuel.collapseFactor = 1;
+
+fuel.p_term = 0;
+fuel.i_term = 0;
+fuel.d_term = 0;
+fuel.integral = 0;
+fuel.derivative = 0;
+fuel.target_pos = fuel.set_point;
+fuel.valve_pos = 0;
+fuel.cv = fuel.valve_pos*Cv_per_turn/steps_per_turn;
+fuel.error = 0;
+
+fuel.targetMdot = fuel_mdot;
+fuel.targetP = fuel_tank_target_p * psiToPa; %Pa
+fuel.CdA = fuel.targetMdot / sqrt(2 * fuel.rho * (fuel.targetP - chamber_pressure));
+
+fuel.P = fuel_tank_target_p * psiToPa;   %Pa
+fuel.nPress = fuel.ullageVol / vanDerWaalSpecMolVol(fuel.P,fuel.T,pressurant.a,pressurant.b);
+
+
+lox.tankVol = lox_tank_volume * litersToCubicMeters; % m^3
+lox.propVol = lox_volume*litersToCubicMeters; %m^3
+lox.ullage = 1 - (lox.propVol/lox.tankVol); % Ullage proporion of water tank
+lox.ullageVol = lox.tankVol * lox.ullage;
+lox.rho = 1050; % kg/m^3
+lox.T = 150; %K 
+lox.collapseFactor = 2.5;
+
+lox.p_term = 0;
+lox.i_term = 0;
+lox.d_term = 0;
+lox.integral = 0;
+lox.derivative = 0;
+lox.target_pos = lox.set_point;
+lox.valve_pos = 0;
+lox.cv = lox.valve_pos*Cv_per_turn/steps_per_turn;
+lox.error = 0;
+
+lox.targetMdot = lox_mdot;
+lox.targetP = lox_tank_target_p * psiToPa; %Pa
+lox.CdA = lox.targetMdot / sqrt(2 * lox.rho * (lox.targetP - chamber_pressure));
+
+lox.P = lox_tank_target_p * psiToPa;   %Pa
+lox.nPress = lox.ullageVol / vanDerWaalSpecMolVol(lox.P,lox.T,pressurant.a,pressurant.b);
+
+
+
+
+%% Log Initialization
+
+time = 0;
+
+time_vec = zeros(1, 1 + maxTime/logInterval);
+
+fuelTankP_vec = zeros(1, 1 + maxTime/logInterval);
+fuelTankUllage_vec = zeros(1, 1 + maxTime/logInterval);
+
+loxTankP_vec = zeros(1, 1 + maxTime/logInterval);
+loxTankUllage_vec = zeros(1, 1 + maxTime/logInterval);
+
+fuel_valve_state_vec = zeros(1, 1 + maxTime/logInterval);
+fuel_p_term_vec = zeros(1, 1 + maxTime/logInterval);
+fuel_i_term_vec = zeros(1, 1 + maxTime/logInterval);
+fuel_d_term_vec = zeros(1, 1 + maxTime/logInterval);
+fuel_error_vec = zeros(1, 1 + maxTime/logInterval);
+
+lox_valve_state_vec = zeros(1, 1 + maxTime/logInterval);
+lox_p_term_vec = zeros(1, 1 + maxTime/logInterval);
+lox_i_term_vec = zeros(1, 1 + maxTime/logInterval);
+lox_d_term_vec = zeros(1, 1 + maxTime/logInterval);
+lox_error_vec = zeros(1, 1 + maxTime/logInterval);
+
+i = 1;
+
+if 0 ~= mod(updateTime,dt)
+    error('dt must evenly divide updateTime')
+end
+
+time_vec(i) = time;
+
+fuelTankP_vec(i) = fuel.P;
+fuelTankUllage_vec(i) = fuel.ullage;
+fuel_valve_state_vec(i) = fuel.valve_pos;
+fuel_p_term_vec(i) = fuel.p_term;
+fuel_i_term_vec(i) = fuel.i_term;
+fuel_d_term_vec(i) = fuel.d_term;
+fuel_error_vec(i) = 0;
+
+loxTankP_vec(i) = lox.P;
+loxTankUllage_vec(i) = lox.ullage;
+lox_valve_state_vec(i) = lox.valve_pos;
+lox_p_term_vec(i) = lox.p_term;
+lox_i_term_vec(i) = lox.i_term;
+lox_d_term_vec(i) = lox.d_term;
+lox_error_vec(i) = 0;
+
+
+%% Loop
+while (time < maxTime) && pressurant.P > fuel.targetP && fuel.ullage < 1 && pressurant.P > lox.targetP && lox.ullage < 1;
+    
+    %% Valve updates
+
+
+    %Checks to see if Needle Valve has reached target state based on
+    % actuation time, and if it has, calculates new target
+    fuel.error = (fuel.targetP - fuel.P)/psiToPa;
+    lox.error = (lox.targetP - lox.P)/psiToPa;
+    if mod(round(time,5), actuation_time) == 0 && time ~= 0;
+        %Checks State and steps if not reached
+        if fuel.valve_pos ~= fuel.target_pos;
+            if fuel.valve_pos < fuel.target_pos;
+                fuel.valve_pos = fuel.valve_pos + step_size;
+            else
+                fuel.valve_pos = fuel.valve_pos - step_size;
+            end
+            fuel.cv = fuel.valve_pos * Cv_per_turn/200;
+            fuel.integral = fuel.integral + actuation_time*(fuel.error);
+        else
+            fuel.p_term = fuel.p_coeff * (fuel.error);
+            fuel.i_term = fuel.i_coeff*(fuel.integral + actuation_time*(fuel.error)*(fuel_i_growth_rate));
+            %finds linear slope of change over the last 9 miliseconds
+            fuel.derivative = ((fuel.error) - (fuel_error_vec(i-1))) / (actuation_time);
+            fuel.d_term = fuel.derivative*fuel.d_coeff;
+
+            fuel.target_pos = fuel.set_point + step_size*floor((fuel.p_term + fuel.i_term + fuel.d_term)/step_size);
+        end
+
+        %Checks State and steps if not reached
+        if lox.valve_pos ~= lox.target_pos;
+            if lox.valve_pos < lox.target_pos;
+                lox.valve_pos = lox.valve_pos + step_size;
+            else
+                lox.valve_pos = lox.valve_pos - step_size;
+            end
+            lox.cv = lox.valve_pos * Cv_per_turn/200;
+            lox.integral = lox.integral + actuation_time*(lox.error);
+        else
+            lox.p_term = lox.p_coeff * (lox.error);
+            lox.i_term = lox.i_coeff*(lox.integral + actuation_time*(lox.error)*(lox_i_growth_rate));
+            %finds linear slope of change over the last 9 miliseconds
+            lox.derivative = ((lox.error) - (lox_error_vec(i-1))) / (actuation_time);
+            lox.d_term = lox.derivative*lox.d_coeff;
+            lox.target_pos = lox.set_point + step_size*floor((lox.p_term + lox.i_term + lox.d_term)/step_size);
+        end
+    end
+
+
+
+
+    %% flow calcs
+    
+    % mol/s through valve (0 if closed)
+    fuel_scfm = CvFlowEq(fuel.cv,pressurant.P,fuel.P,pressurant.T,pressurant.sg);
+    lox_scfm = CvFlowEq(lox.cv,pressurant.P,lox.P,pressurant.T,pressurant.sg);
+
+    if ~isreal(fuel_scfm);
+        break
+    end
+
+    if ~isreal(lox_scfm);
+        break
+    end
+
+    fuel.valveFlow = SCFMToMolarFlow(fuel_scfm,fuel.P,fuel.T,pressurant.a,pressurant.b);
+    lox.valveFlow = SCFMToMolarFlow(lox_scfm,lox.P,lox.T,pressurant.a,pressurant.b);
+    
+
+    fuel.propFlow = propellantVolFlow(fuel.CdA, fuel.rho, fuel.P);
+    lox.propFlow = propellantVolFlow(lox.CdA, lox.rho, lox.P);
+    
+    %% integration via euler's method
+
+    % add flow to tanks
+    fuel.nPress = fuel.nPress + fuel.valveFlow * dt;
+    lox.nPress = lox.nPress + lox.valveFlow * dt;
+    
+    % remove propellants from tanks
+    fuel.propVol = fuel.propVol - fuel.propFlow * dt;
+    lox.propVol = lox.propVol - lox.propFlow * dt;
+    
+    % update ullage
+    fuel.ullageVol = fuel.tankVol - fuel.propVol;
+    fuel.ullage = fuel.ullageVol / fuel.tankVol;
+
+    lox.ullageVol = lox.tankVol - lox.propVol;
+    lox.ullage = lox.ullageVol / lox.tankVol;
+    
+    % update tank pressures
+    fuel.P = vanDerWaalPressure(fuel.ullageVol/fuel.nPress, fuel.T, pressurant.a, pressurant.b);
+    lox.P = vanDerWaalPressure(lox.ullageVol/lox.nPress, lox.T, pressurant.a, pressurant.b);
+    
+    time = time + dt;
+    
+    %% logging
+
+    % only log data every $updateTime$ seconds
+    if abs(mod(round(time,5), logInterval)) < 0.5*dt
+        i = i + 1;
+        time_vec(i) = time;
+        fuelTankP_vec(i) = fuel.P;
+        fuelTankUllage_vec(i) = fuel.ullage;
+        fuel_valve_state_vec(i) = fuel.valve_pos; 
+        fuel_p_term_vec(i) = fuel.p_term; 
+        fuel_i_term_vec(i) = fuel.i_term;
+        fuel_d_term_vec(i) = fuel.d_term;
+        fuel_error_vec(i) = fuel.error;
+       
+        loxTankP_vec(i) = lox.P;
+        loxTankUllage_vec(i) = lox.ullage;
+        lox_valve_state_vec(i) = lox.valve_pos; 
+        lox_p_term_vec(i) = lox.p_term; 
+        lox_i_term_vec(i) = lox.i_term;
+        lox_d_term_vec(i) = lox.d_term;
+        lox_error_vec(i) = lox.error;
+
+         
+    end
+end
+
+
+%% trim off unused space in vectors
+i = i + 1;
+
+time_vec(i:end) = [];
+fuelTankP_vec(i:end) = [];
+fuelTankUllage_vec(i:end) = [];
+fuel_valve_state_vec(i:end) = [];
+fuel_p_term_vec(i:end) = []; 
+fuel_i_term_vec(i:end) = [];
+fuel_d_term_vec(i:end) = [];
+fuel_error_vec(i:end) = [];
+loxTankP_vec(i:end) = [];
+loxTankUllage_vec(i:end) = [];
+lox_valve_state_vec(i:end) = [];
+lox_p_term_vec(i:end) = []; 
+lox_i_term_vec(i:end) = [];
+lox_d_term_vec(i:end) = [];
+lox_error_vec(i:end) = [];
+
+
+
+% convert to psi
+fuelTankP_vec = fuelTankP_vec ./ psiToPa;
+loxTankP_vec = loxTankP_vec ./ psiToPa;
+% OrfP_vec = OrfP_vec ./ psiToPa;
+
+% convert to percent
+fuelTankUllage_vec = fuelTankUllage_vec .* 100;
+loxTankUllage_vec = loxTankUllage_vec .* 100;
+
+%% Graphing
+
+%figure
+%plot(time_vec, OrfP_vec)
+
+figure
+% Plots Tank Pressure over Time
+subplot(2,2,1)
+hold on
+plot(time_vec, fuelTankP_vec , "-r")
+yline(fuel.targetP / psiToPa,'--r')
+grid on
+xlabel("Time (s)")
+ylabel('Tank Pressure (PSI)')
+legend({'Fuel', 'Fuel Target'},'Location','northeast');
+
+subplot(2,2,2)
+hold on
+plot(time_vec, loxTankP_vec , "-r")
+yline(lox.targetP / psiToPa ,'--r')
+grid on
+xlabel("Time (s)")
+ylabel('Tank Pressure (PSI)')
+legend({'LOX', 'LOX Target'},'Location','northwest');
+
+
+
+
+% Local Tank Pressure RMSE over time
+% RMSE = Root Mean Square Error, or the square root of the mean of the
+% square of the error. We use a convolution (conv) to take the mean
+% specifically over +-windowRadiusT from a given point
+subplot(2,2,3)
+
+windowRadiusT = 1; % taken over +- 1s
+windowRadiusi = round(windowRadiusT / logInterval);
+convWindow = repelem(1/(2*windowRadiusi + 1), 2*windowRadiusi + 1);
+waterTankLocalRMSE = sqrt(conv((fuelTankP_vec - fuel.targetP / psiToPa).^2, convWindow,'valid'));
+
+hold on
+plot(time_vec(1 + windowRadiusi:end - windowRadiusi), waterTankLocalRMSE, "-r")
+grid on
+xlabel("Time (s)")
+ylabel('Fuel Tank Pressure RMSE (PSI)')
+legend('Fuel');
+
+subplot(2,2,4)
+
+windowRadiusT = 1; % taken over +- 1s
+windowRadiusi = round(windowRadiusT / logInterval);
+convWindow = repelem(1/(2*windowRadiusi + 1), 2*windowRadiusi + 1);
+loxTankLocalRMSE = sqrt(conv((loxTankP_vec - lox.targetP / psiToPa).^2, convWindow,'valid'));
+
+hold on
+plot(time_vec(1 + windowRadiusi:end - windowRadiusi), loxTankLocalRMSE, "-r")
+grid on
+xlabel("Time (s)")
+ylabel('LOX Tank Pressure RMSE (PSI)')
+legend('LOX');
+
+
+figure 
+
+subplot(2,2,1)
+
+hold on
+plot(time_vec, fuel_valve_state_vec, "-r");
+xlabel("Time (s)");
+ylabel('Valve Position (200 = 360deg)');
+legend({'Fuel'},'Location','southeast');
+hold off
+
+subplot(2,2,2)
+
+hold on
+plot(time_vec, fuel_error_vec)
+plot(time_vec, fuel_p_term_vec)
+plot(time_vec, fuel_i_term_vec)
+plot(time_vec, fuel_d_term_vec)
+
+legend('Fuel Error','fuel_p','fuel_i','fuel_d')
+
+
+subplot(2,2,3)
+
+hold on
+plot(time_vec, lox_valve_state_vec, "-r");
+xlabel("Time (s)");
+ylabel('Valve Position');
+legend({'LOX'},'Location','southeast');
+hold off
+
+subplot(2,2,4)
+
+hold on
+plot(time_vec, lox_error_vec)
+plot(time_vec, lox_p_term_vec)
+plot(time_vec, lox_i_term_vec)
+plot(time_vec, lox_d_term_vec)
+legend('LOX Error','lox_p','lox_i','lox_d')
+hold off
+
+figure
+
+subplot(2,2,1)
+hold on
+plot(time_vec, loxTankUllage_vec)
+xlabel('Time (s)')
+ylabel('LOX Tank Ullage (%)')
+legend('LOX Tank Ullage')
+hold off
+
+subplot(2,2,2)
+hold on
+plot(time_vec, fuelTankUllage_vec)
+xlabel('Time (s)')
+ylabel('Fuel Tank Ullage (%)')
+legend('Fuel Tank Ullage')
+
+
+
+%Max Fluctuation
+Fluctuation = [max(fuelTankP_vec) - min(fuelTankP_vec)] % psi
+
+%Burn time
+BurnTime = time
+
+%End Timer
+toc
+
+%% Utility Functions
+
+function out = ternary(bool, a, b)
+    if bool
+        out = a;
+    else
+        out = b;
+    end
+end
+
+%% Core Functions
+
+% bool - if the reg is enabled
+% regV - effective stagnation spec vol of the reg's output
+% trueV - actual stagnation spec vol of the COPV
+% V - value to use in flow eqns
+function V = regUpstreamRho(bool, regV, trueV)
+    if bool
+        V = max([regV trueV]);
+    else
+        V = trueV;
+    end
+end
+
+% molar flow for compressible fluid (pressurant)
+% molFlow (molar flow rate) = mol/s
+% upstreamV (specific molar volume) = m^3/mol (NOT m^3/kg or mol/m^3!!!)
+% downstreamV (specific molar volume) = m^3/mol (NOT m^3/kg or mol/m^3!!!)
+% area (flow area) = m^2
+% gamma (heat capacity ratio) = nondim
+% Rspec (specific gas const) = J/kgK (NOT UNIVERSAL)
+% molMass (gas molar mass) = g/mol
+% upstreamT (temperature) = K
+% downstreamT (temperature) = K
+% a (van der waal a const) = m^6 Pa/mol^2
+% b (van der waal b const) = m^3/mol
+function [molFlow] = gasFlow(upstreamV, downstreamV, area, gamma, Rspec, molMass, upstreamT, downstreamT, a, b)
+    upstreamP = vanDerWaalPressure(upstreamV, upstreamT, a, b);
+    downstreamP = vanDerWaalPressure(downstreamV, downstreamT, a, b);
+    
+    criticalP = downstreamP * (2/(gamma+1))^(gamma/(1-gamma));
+    
+    if criticalP <= upstreamP
+        % flow is choked
+        molFlow = (upstreamP * area * 1000 / molMass) * sqrt(gamma / (upstreamT * Rspec)) * (2/(gamma+1))^((gamma+1)/(2*(gamma-1)));
+    else
+        % flow is unchoked
+        % I cannot find a good equation for this so I'm going to linearize
+        % between dP = 0, mdot=0, and the mdot at critical pressure
+        
+        chokedMolFlux = (upstreamP * area * 1000 / molMass) * sqrt(gamma / (upstreamT * Rspec)) * (2/(gamma+1))^((gamma+1)/(2*(gamma-1)));
+        molFlow = chokedMolFlux * ((upstreamP - downstreamP)/(criticalP - downstreamP));
+    end
+end
+
+% volumetric flow for incompressible fluid (propellants)
+% volFlow (volumetric flow rate) = m^3/s
+% CdA (effective flow area) = m^2
+% rho (density) = kg/m^3
+% delP (differential pressure) = Pa
+function [volFlow] = propellantVolFlow(exit_area,rho,delP)
+    Vel = sqrt(2*delP/rho);
+    volFlow = Vel*exit_area;
+end
+
+% Solve for pressure using Van der Waal equation of state
+% P (pressure) = Pa
+% v (specific molar volume) = m^3/mol (NOT m^3/kg!)
+% T (temperature) = K
+% a (van der waal a const) = m^6 Pa/mol^2
+% b (van der waal b const) = m^3/mol
+function [P] = vanDerWaalPressure(v,T,a,b)
+    R = 8.3145; %J/(mol*K), universal gas constant
+    P = (R*T) / (v-b) - a / v^2;
+end
+
+% Solve for specific molar volume using Van der Waal equation of state
+% v (specific molar volume) = m^3/mol (NOT m^3/kg!)
+% P (pressure) = Pa
+% T (temperature) = K
+% a (van der waal a const) = m^6 Pa/mol^2
+% b (van der waal b const) = m^3/mol
+function [v] = vanDerWaalSpecMolVol(P,T,a,b)
+    R = 8.3145; %J/(mol*K), universal gas constant
+    
+    % use Cardano's method of solving cubic functions
+    % https://math.vanderbilt.edu/schectex/courses/cubic/
+    
+    % fit van der waals' to av^3 + bv^2 + cv + d = 0
+    cubicA = -P;
+    cubicB = P * b + R * T;
+    cubicC = -a;
+    cubicD = a * b;
+
+    %{
+    % math magic idk
+    cubicP = -cubicB / (3*cubicA);
+    cubicQ = cubicP^3 + (cubicB * cubicC - 3 * cubicA * cubicD)/(6 * cubicA^2);
+    cubicR = cubicC / (3*cubicA);
+
+    % scary function but it works
+    v = (cubicQ + (cubicQ^2 + (cubicR - cubicP^2)^3)^(1/2))^(1/3) +...
+        (cubicQ - (cubicQ^2 + (cubicR - cubicP^2)^3)^(1/2))^(1/3) + cubicP;     
+    %}
+    
+    r = roots([cubicA cubicB cubicC cubicD]);
+    r = r(imag(r) == 0); % discard nonreal roots
+    if isempty(r)
+        error(['FUCK (This should be impossible but idk. You need to change your coefficents ' ...
+            'and run the trim vector and plotting sections to see what to change'])
+    end
+    v = r(end);
+end
+
+
+% Solve for SCFM flow rate using Cv Equation
+% P (pressure) = Pa
+% T (temperature) = K
+% Q (flow rate) = SCFM
+function [Q] = CvFlowEq(Cv,Up_p,Down_p,T,sg);
+    T = T*1.8; %kelvin to Rankine
+    Up_p = Up_p/6894.76; %Pa to PSI
+    Down_p = Down_p/6894.76; %Pa to PSI
+    if Up_p > 2*Down_p;
+        %flow is choked
+        Q = 13.61*Up_p*Cv*sqrt(1/(sg*T));
+    else;
+        %flow is not choked
+        Q = 16.05*Cv*sqrt((Up_p^2-Down_p^2)/(sg*T));
+    end
+end
+
+% Solve for SCFM flow rate using Cv Equation
+% P (pressure) = Pa
+% T (temperature) = K
+% Q (flow rate) = SCFM
+function [molar_flow] = SCFMToMolarFlow(SCFMFlow, P, T,press_a,press_b);
+    T_rankine = T*1.8; %Kelvin to Rankine
+    P_psi = P/6894.76; %Pa to PSI
+    acfm = SCFMFlow*(14.7/P_psi)*(T_rankine/520); %ft^3/min
+    vol_flow_rate = acfm*0.02832/60; %ft^3/min*s/min*m^3/ft^3,  m^3/s
+    spec_volume = vanDerWaalSpecMolVol(P, T, press_a,press_b);
+    molar_flow = vol_flow_rate/ spec_volume;
+end
